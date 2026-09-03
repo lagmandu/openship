@@ -48,6 +48,7 @@ import type {
   ShellOptions,
   ShellSession,
   ProvisionLock,
+  ResourceConfig,
 } from "../types";
 import type { PortProbeExecutor } from "../system/port-listen";
 import { PassThrough, Writable, type Readable } from "node:stream";
@@ -200,7 +201,17 @@ const RESTART_POLICIES: Record<string, { Name: string; MaximumRetryCount: number
   no: { Name: "no", MaximumRetryCount: 0 },
 };
 
-const DOCKER_BUILD_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+/**
+ * Max idle duration (time without progress output from the Docker build) before
+ * terminating the build as stalled. Defaults to 10 minutes (overridable via
+ * OPENSHIP_BUILD_IDLE_TIMEOUT_MS).
+ */
+export function getDockerBuildIdleTimeoutMs(): number {
+  const envVal = Number(process.env.OPENSHIP_BUILD_IDLE_TIMEOUT_MS);
+  return Number.isFinite(envVal) && envVal > 0 ? envVal : 10 * 60 * 1000;
+}
+
+export const DOCKER_BUILD_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * A deployment build and its cancellation request may resolve separate
@@ -1288,8 +1299,28 @@ export class DockerRuntime implements RuntimeAdapter {
   }
 
   private extractBuildFailureHint(line: string): string | null {
-    if (/returned a non-zero code:\s*\d+/i.test(line)) {
+    const nonZeroMatch = line.match(/returned a non-zero code:\s*(\d+)/i);
+    if (nonZeroMatch) {
+      const code = Number(nonZeroMatch[1]);
+      if (code === 137) {
+        return `${line} — The build process was killed by the Out-Of-Memory (OOM) killer (exit code 137). The build exceeded its allocated memory limit. Increase the project's Build Memory in OpenShip Settings -> Resources, or allocate more RAM/swap to the host.`;
+      }
+      if (code === 143) {
+        return `${line} — The build process was terminated by SIGTERM (exit code 143). The container was stopped or cancelled.`;
+      }
       return line;
+    }
+
+    if (
+      /JavaScript heap out of memory|Fatal process out of memory|fatal error: runtime: out of memory/i.test(
+        line,
+      )
+    ) {
+      return `${line} — Process ran out of memory. Increase Build Memory in OpenShip Settings -> Resources or configure NODE_OPTIONS="--max-old-space-size=...".`;
+    }
+
+    if (/npm ERR! code ENOMEM/i.test(line)) {
+      return `${line} — npm ran out of memory while installing dependencies. Increase Build Memory in OpenShip Settings -> Resources.`;
     }
 
     // The legacy builder's own wording for "this Dockerfile needs BuildKit". Reached
@@ -1529,7 +1560,14 @@ export class DockerRuntime implements RuntimeAdapter {
     // different: surface it as a cancelled BuildResult instead of continuing
     // through image verification and deploy.
     if (signal?.aborted) throw new BuildCancelledError();
-    if (code !== 0) throw new Error(`docker build exited with code ${code}`);
+    if (code !== 0) {
+      if (code === 137) {
+        throw new Error(
+          `docker build was killed by the Out-Of-Memory (OOM) killer (exit code 137). The build exceeded available RAM on the remote server. Increase Build Memory in OpenShip Settings -> Resources or allocate more RAM/swap to the server.`,
+        );
+      }
+      throw new Error(`docker build exited with code ${code}`);
+    }
     this.emitDockerStep(log, "install", "completed", "Image build finished");
   }
 
@@ -1875,7 +1913,7 @@ export class DockerRuntime implements RuntimeAdapter {
       });
 
       log.log("Connected to Docker daemon. Build output follows:");
-      await this.streamDockerodeBuild(stream, log, builder.trace);
+      await this.streamDockerodeBuild(stream, log, builder.trace, config.resources);
       log.log("Docker daemon finished streaming build output. Finalizing image...\n");
     } catch (err) {
       // A context-pack failure aborts the request, so the rejection here is the
@@ -1904,57 +1942,134 @@ export class DockerRuntime implements RuntimeAdapter {
     stream: NodeJS.ReadableStream,
     log: BuildLogger,
     trace?: BuildKitTraceDecoder,
+    buildLimits?: Partial<ResourceConfig> | null,
   ): Promise<void> {
     let fatalBuildError: string | null = null;
+    const buildStartTime = Date.now();
+    const timeoutMs = getDockerBuildIdleTimeoutMs();
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       let idleTimer: NodeJS.Timeout | null = null;
-      let keepaliveTimer: NodeJS.Timeout | null = null;
-      let idleMinutes = 0;
+      let watchdogTimer: NodeJS.Timeout | null = null;
+      let silentSeconds = 0;
+      let consecutiveStarvingChecks = 0;
 
       const clearTimers = () => {
         if (idleTimer) {
           clearTimeout(idleTimer);
           idleTimer = null;
         }
-        if (keepaliveTimer) {
-          clearInterval(keepaliveTimer);
-          keepaliveTimer = null;
+        if (watchdogTimer) {
+          clearInterval(watchdogTimer);
+          watchdogTimer = null;
         }
-        idleMinutes = 0;
+        silentSeconds = 0;
+        consecutiveStarvingChecks = 0;
       };
 
-      const fail = (error: Error) => {
+      const failOnce = (error: Error) => {
         if (settled) return;
         settled = true;
         clearTimers();
-        (stream as any).destroy?.(error);
+        try {
+          (stream as any).destroy?.();
+        } catch {
+          // ignore
+        }
         reject(error);
       };
 
-      const succeed = () => {
+      const succeedOnce = () => {
         if (settled) return;
         settled = true;
         clearTimers();
         resolve();
       };
 
+      // Memory starvation watchdog: inspect intermediate build container stats during silence.
+      // If pinned at >= 95% memory limit for consecutive checks, terminate immediately.
+      const checkMemoryStarvation = async () => {
+        if (settled) return;
+        if (!buildLimits?.memoryMb || buildLimits.memoryMb <= 0) return;
+
+        try {
+          const containers = await this.docker.listContainers({ limit: 10 });
+          if (settled) return;
+          for (const c of containers) {
+            if (settled) return;
+            if (c.Created * 1000 >= buildStartTime - 10_000) {
+              const stats = await this.docker.getContainer(c.Id).stats({ stream: false });
+              if (settled) return;
+              const usage = stats.memory_stats?.usage ?? 0;
+              const limit = stats.memory_stats?.limit ?? 0;
+              if (limit > 0 && usage > 0) {
+                const ratio = usage / limit;
+                if (ratio >= 0.95) {
+                  consecutiveStarvingChecks += 1;
+                  const usageMb = Math.round(usage / (1024 * 1024));
+                  const limitMb = Math.round(limit / (1024 * 1024));
+                  if (consecutiveStarvingChecks >= 2) {
+                    const starvingErr = new Error(
+                      `Docker build terminated: container is memory-starved (${usageMb}MB / ${limitMb}MB, ${(ratio * 100).toFixed(1)}% limit reached). The compiler or build process ran out of RAM and stalled in swap thrashing. Increase the project's Build Memory limit in OpenShip Settings -> Resources.`,
+                    );
+                    failOnce(starvingErr);
+                    void this.docker.getContainer(c.Id).kill().catch(() => {});
+                    return;
+                  } else {
+                    log.log(
+                      `Build memory warning: container is near memory limit (${usageMb}MB / ${limitMb}MB, ${(ratio * 100).toFixed(1)}%). If it runs out of memory, the build will be terminated.`,
+                      "warn",
+                    );
+                  }
+                } else {
+                  consecutiveStarvingChecks = 0;
+                }
+              }
+            }
+          }
+        } catch {
+          // Non-fatal if container stats cannot be read
+        }
+      };
+
       const resetIdleTimer = () => {
         clearTimers();
-        keepaliveTimer = setInterval(() => {
-          idleMinutes += 1;
-          log.log(`Still building... (no output for ${idleMinutes}m)`);
-        }, 60_000);
-        if ((keepaliveTimer as any).unref) (keepaliveTimer as any).unref();
+
+        watchdogTimer = setInterval(() => {
+          silentSeconds += 15;
+          if (silentSeconds % 60 === 0) {
+            const idleMinutes = silentSeconds / 60;
+            const memoryMb = buildLimits?.memoryMb;
+            if (idleMinutes >= 2 && memoryMb && memoryMb > 0) {
+              log.log(
+                `Still building... (no output for ${idleMinutes}m · build memory limit is ${memoryMb}MB)`,
+                "warn",
+              );
+            } else {
+              log.log(`Still building... (no output for ${idleMinutes}m)`);
+            }
+          }
+
+          if (silentSeconds >= 30) {
+            void checkMemoryStarvation();
+          }
+        }, 15_000);
+        if ((watchdogTimer as any).unref) (watchdogTimer as any).unref();
 
         idleTimer = setTimeout(() => {
-          fail(
+          if (settled) return;
+          const memoryMb = buildLimits?.memoryMb;
+          const resourceContext =
+            memoryMb && memoryMb > 0
+              ? ` The build was constrained to ${memoryMb}MB RAM (OpenShip Build Resources). Resource-intensive compilers (Next.js/Turbopack, Vite, Webpack, Rust) often require >1GB and cause silent swap thrashing if memory is constrained. Increase Build Memory in Project Settings -> Resources.`
+              : "";
+          failOnce(
             new Error(
-              "Docker build produced no output for 30 minutes. This usually means the remote server cannot reach the package registry, has broken DNS, or the Docker daemon stalled during the build.",
+              `Docker build produced no output for ${Math.round(timeoutMs / 60_000)} minutes and timed out.${resourceContext} Other common causes: remote server cannot reach package registry, broken DNS, or a stalled process waiting for input.`,
             ),
           );
-        }, DOCKER_BUILD_IDLE_TIMEOUT_MS);
+        }, timeoutMs);
         if ((idleTimer as any).unref) (idleTimer as any).unref();
       };
 
@@ -1964,10 +2079,10 @@ export class DockerRuntime implements RuntimeAdapter {
         stream,
         (err: Error | null) => {
           if (err) {
-            fail(err);
+            failOnce(err);
             return;
           }
-          succeed();
+          succeedOnce();
         },
         (event) => {
           resetIdleTimer();
@@ -2951,7 +3066,12 @@ export class DockerRuntime implements RuntimeAdapter {
                 ...builder.options,
                 abortSignal,
               });
-              await this.streamDockerodeBuild(stream, spec.logger, builder.trace);
+              await this.streamDockerodeBuild(
+                stream,
+                spec.logger,
+                builder.trace,
+                spec.config.resources,
+              );
             } catch (err) {
               const contextErr = takeError();
               throw contextErr
